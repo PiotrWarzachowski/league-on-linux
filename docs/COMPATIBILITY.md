@@ -52,6 +52,7 @@ maintainer will add it.
 | Distro / desktop | CPU / GPU | Driver | Session | Kernel | Runtime | Result | Frame pacing |
 |---|---|---|---|---|---|---|---|
 | Omarchy (Arch), Hyprland | Intel i5-10210U / Intel UHD 620 | `i915`, Mesa ANV | Wayland + Xwayland | 7.2.5 | patched Darling, `-O2` libc/libc++ | Client, game, ARAM/Swiftplay and store work; playable at low settings | 24–32 avg FPS over five ARAM matches; p99 44–98 ms; slowest quarter 20–27 FPS |
+| Void Linux host, Ubuntu 26.04 distrobox; niri | Intel i7-11800H / NVIDIA RTX 3080 Laptop (hybrid with Intel UHD, PRIME render offload) | `nvidia` 595.112.07 | Wayland + Xwayland, 3440×1440 external monitor | 7.3.5 | commit `edff620` plus the container fixes noted below | Client, game, tutorials and ARAM work | ARAM 103.2 and 99.7 avg FPS; p99 12.0 and 14.0 ms; slowest quarter 92.6 and 85.4 FPS (GPU thermally throttled, see notes) |
 
 Notes for the UHD 620 row:
 
@@ -65,6 +66,27 @@ Notes for the UHD 620 row:
 - Expect first-match shader compilation to show up as a high `p99` until the
   cache is warm.
 
+Notes for the RTX 3080 Laptop row:
+
+- Measured 2026-11-27 with `tools/perf-baseline.py` on two ARAM matches of about
+  23 and 17 minutes. A shorter tutorial match on the same setup averaged
+  135.1 FPS.
+- The laptop's cooling limited the GPU. With the fans at full
+  speed the driver still reported `SW Thermal Slowdown` in 256 of 270 samples
+  during the 103.2 FPS match (87 °C, about 1390 of 2100 MHz, 56 W of 140 W).
+  Without full fan speed a tutorial match ran with the GPU held at 210 MHz and
+  averaged 66.0 FPS. Expect higher numbers from the same GPU with working cooling.
+- PRIME render offload copies every frame to the integrated GPU, which drives
+  the display; see [PRIME render offload halves the frame rate](TROUBLESHOOTING.md#prime-render-offload-halves-the-frame-rate).
+- The install ran `scripts/install-native.sh` inside a distrobox container
+  (`--nvidia`, Docker) with the manual workarounds that
+  [#3](https://github.com/PiotrWarzachowski/league-on-linux/pull/3) (NVIDIA GBM
+  link and EGL X11 platform libraries),
+  [#4](https://github.com/PiotrWarzachowski/league-on-linux/pull/4) (Vulkan
+  device order under PRIME offload) and
+  [#5](https://github.com/PiotrWarzachowski/league-on-linux/pull/5) (installer
+  inside distrobox) turn into fixes.
+
 The Ryzen 5 5500 / RX 6600 development machine is faster and is documented
 separately in [status](STATUS.md#game-fps-2026-10-1314). It is not a laptop
 baseline and should not be read as the expected result on integrated graphics.
@@ -75,7 +97,6 @@ These are common laptop configurations without a confirmed play test here.
 Reports are welcome, but treat them as unknown rather than supported:
 
 - Recent AMD integrated graphics (Radeon 680M/780M) under RADV.
-- NVIDIA hybrid laptops using PRIME render offload.
 - Fedora Silverblue and other immutable distributions with Nix.
 - Intel Arc discrete GPUs.
 
