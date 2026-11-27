@@ -335,5 +335,59 @@ class NvidiaVram(HostEnvFixture):
         self.assertIn('if host_gpus_all_nvidia; then', pin)
 
 
+class PrimeVulkanDevice(HostEnvFixture):
+    FUNCTIONS = launcher_text('host_nvidia_drm_device() {', '\nselect_prime_vulkan_device\n')
+    HYBRID = (('0x8086', '0x9a60'), ('0x10de', '0x249c'))
+
+    def drm(self, *cards):
+        root = Path(tempfile.mkdtemp(dir=self.tmp.name)) / 'drm'
+        for index, (vendor, device) in enumerate(cards):
+            folder = root / f'card{index}' / 'device'
+            folder.mkdir(parents=True)
+            (folder / 'vendor').write_text(vendor + '\n')
+            (folder / 'device').write_text(device + '\n')
+        (root / 'card0-DP-1').mkdir(parents=True)
+        return str(root)
+
+    def device(self, *cards):
+        return self.run_block(self.FUNCTIONS, 'host_nvidia_drm_device "$2"', self.drm(*cards))
+
+    def select(self, *cards, **env):
+        tail = 'select_prime_vulkan_device "$2"; printf "%s\\n" "${MESA_VK_DEVICE_SELECT-unset}"'
+        return self.run_block(self.FUNCTIONS, tail, self.drm(*(cards or self.HYBRID)), **env)
+
+    def test_the_nvidia_device_id_is_printed_on_a_hybrid_host(self):
+        self.assertEqual(self.device(*self.HYBRID), '249c')
+        self.assertEqual(self.device(*reversed(self.HYBRID)), '249c')
+        self.assertEqual(self.device(('0x10de', '0x249C')), '249c')
+
+    def test_nothing_is_printed_without_an_nvidia_card(self):
+        self.assertEqual(self.device(), '')
+        self.assertEqual(self.device(('0x8086', '0x9a60')), '')
+        self.assertEqual(self.device(('0x8086', '0x9a60'), ('0x1002', '0x1638')), '')
+        self.assertEqual(self.device(('0x10de', 'garbage')), '')
+
+    def test_the_launcher_exports_the_nvidia_device_only_under_prime_offload(self):
+        self.assertEqual(self.select(__NV_PRIME_RENDER_OFFLOAD='1'), '10de:249c!')
+        self.assertEqual(self.select(), 'unset')
+        self.assertEqual(self.select(__NV_PRIME_RENDER_OFFLOAD='0'), 'unset')
+        self.assertEqual(self.select(('0x8086', '0x9a60'), __NV_PRIME_RENDER_OFFLOAD='1'), 'unset')
+
+    def test_a_user_value_is_left_untouched(self):
+        self.assertEqual(self.select(__NV_PRIME_RENDER_OFFLOAD='1', MESA_VK_DEVICE_SELECT='8086:9a60!'),
+                         '8086:9a60!')
+        self.assertEqual(self.select(__NV_PRIME_RENDER_OFFLOAD='1', MESA_VK_DEVICE_SELECT=''), '')
+
+    def test_nodevice_select_disables_the_default(self):
+        self.assertEqual(self.select(__NV_PRIME_RENDER_OFFLOAD='1', NODEVICE_SELECT='1'), 'unset')
+        self.assertEqual(self.select(__NV_PRIME_RENDER_OFFLOAD='1', NODEVICE_SELECT=''), 'unset')
+
+    def test_the_default_is_set_before_the_helpers_start_darling(self):
+        source = LAUNCHER.read_text()
+        call = source.index('\nselect_prime_vulkan_device\n')
+        self.assertLess(call, source.index('python3 "$runner_dir/ensure-darling-root-certificates.py"'))
+        self.assertLess(call, source.index('newest_xwayland_cookie() {'))
+
+
 if __name__ == '__main__':
     unittest.main()

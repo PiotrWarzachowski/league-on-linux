@@ -57,6 +57,8 @@ ENV_ALLOWLIST = (
     '__VK_LAYER_NV_optimus',
     '__GLX_VENDOR_LIBRARY_NAME',
     'DRI_PRIME',
+    'MESA_VK_DEVICE_SELECT',
+    'NODEVICE_SELECT',
 )
 # Variables that only add tracing. Left set, they slow the client or change its
 # behaviour (the input trace once made the game see stray clicks), so the
