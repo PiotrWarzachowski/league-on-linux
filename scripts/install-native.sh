@@ -3,7 +3,14 @@
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
 TARGET_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd)
 LOG="${XDG_CACHE_HOME:-$HOME/.cache}/darling-lol-install.log"
-TOOLBOX_NAME="${DARLING_LOL_TOOLBOX_NAME:-darling-lol}"
+DEFAULT_TOOLBOX_NAME=darling-lol
+TOOLBOX_NAME="${DARLING_LOL_TOOLBOX_NAME:-$DEFAULT_TOOLBOX_NAME}"
+# DARLING_LOL_TOOLBOX_ENV_FILE is a test seam; production always reads
+# /run/.toolboxenv, which Toolbox and distrobox both create.
+TOOLBOX_ENV_FILE="${DARLING_LOL_TOOLBOX_ENV_FILE:-/run/.toolboxenv}"
+# How messages name the container and how the user re-enters it.
+CONTAINER_KIND=Toolbox
+ENTER_COMMAND=toolbox
 
 readonly MIN_FREE_GIB=50
 readonly MIN_REINSTALL_FREE_GIB=5
@@ -61,8 +68,18 @@ LOCALE_EXPLICIT=0
 BG_PID=''
 SUDO_PID=''
 
-if [[ -f /run/.toolboxenv || ${DARLING_LOL_TOOLBOX:-0} == 1 ]]; then
+if [[ -f $TOOLBOX_ENV_FILE || ${DARLING_LOL_TOOLBOX:-0} == 1 ]]; then
   INSIDE_TOOLBOX=1
+fi
+
+# distrobox sets CONTAINER_ID to the container name next to the same marker
+# file. The --toolbox re-exec (DARLING_LOL_TOOLBOX=1 with an explicit name)
+# always runs in a Toolbox and keeps its own name and wording.
+if [[ -f $TOOLBOX_ENV_FILE && -n ${CONTAINER_ID:-} ]] &&
+  [[ ${DARLING_LOL_TOOLBOX:-0} != 1 || -z ${DARLING_LOL_TOOLBOX_NAME:-} ]]; then
+  CONTAINER_KIND=distrobox
+  ENTER_COMMAND=distrobox
+  TOOLBOX_NAME="${DARLING_LOL_TOOLBOX_NAME:-$CONTAINER_ID}"
 fi
 
 if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
@@ -263,7 +280,8 @@ Options:
 Environment:
   RCLOL_REGION               Riot server region, same as --region
   RCLOL_LOCALE               Riot client locale, same as --locale
-  DARLING_LOL_TOOLBOX_NAME   Toolbox container name (default: darling-lol)
+  DARLING_LOL_TOOLBOX_NAME   Toolbox container name (default: darling-lol; inside
+                             distrobox, the container's own name)
   DARLING_LOL_TOOLBOX_RELEASE  Fedora release for 'toolbox create' on non-Fedora
                              hosts (default: ${DEFAULT_FEDORA_RELEASE})
   DARLING_LOL_DESKTOP_ENTRY  Create the desktop entry without asking (1/0);
@@ -594,6 +612,10 @@ gib_display() {
   awk -v kib="$1" 'BEGIN { printf "%.1f", kib / 1024 / 1024 }'
 }
 
+require_git() {
+  command -v git >/dev/null 2>&1 || fail 'Git is required.'
+}
+
 preflight() {
   [[ $EUID -ne 0 ]] || fail 'Run as a regular user, not root.'
   [[ $(uname -m) == x86_64 ]] || fail 'Only x86_64 is supported.'
@@ -602,7 +624,11 @@ preflight() {
   if [[ $CONTAINER_INSTALL == 0 ]]; then
     command -v sudo >/dev/null 2>&1 || fail 'sudo is required.'
   fi
-  command -v git >/dev/null 2>&1 || fail 'Git is required.'
+  # Inside a container the package step below installs git, so the check moves
+  # after it; a host install has to bring git itself.
+  if (( ! INSIDE_TOOLBOX )); then
+    require_git
+  fi
 
   local kernel_major kernel_minor free_kib footprint_kib total_kib required_kib
   IFS=. read -r kernel_major kernel_minor _ < <(uname -r)
@@ -1269,7 +1295,7 @@ finish() {
   if (( ! shortcut_ready )); then
     printf 'To start the runtime:\n'
     if (( INSIDE_TOOLBOX )); then
-      printf '  toolbox enter %s\n' "$TOOLBOX_NAME"
+      printf '  %s enter %s\n' "$ENTER_COMMAND" "$TOOLBOX_NAME"
     fi
     printf '  cd "%s"\n' "$TARGET_DIR"
     printf '  RCLOL_REGION=%s RCLOL_LOCALE=%s sh scripts/run.sh\n\n' \
@@ -1303,7 +1329,7 @@ main() {
   fi
 
   if (( INSIDE_TOOLBOX )); then
-    info "Running inside Toolbox '$TOOLBOX_NAME'."
+    info "Running inside $CONTAINER_KIND '$TOOLBOX_NAME'."
   fi
 
   detect_distribution
@@ -1339,6 +1365,9 @@ main() {
     run 'Installing build dependencies' install_packages
   fi
 
+  # Container installs skip the early check: git comes with the packages above.
+  require_git
+
   # Fail fast: surface an active Riot/League session before the long build,
   # but after dependency installation so hosts without Python can reach it.
   ensure_no_active_session
@@ -1373,8 +1402,10 @@ main() {
   if [[ ${DARLING_LOL_TOOLBOX:-0} == 1 && $INSIDE_TOOLBOX == 1 ]]; then
     # Record the container so scripts/update.sh can re-exec itself inside it:
     # the build cache and the installed runtime belong to this container.
+    # A distrobox name taken from CONTAINER_ID is not recorded: update.sh
+    # re-execs through `toolbox run`, which cannot enter a distrobox.
     mkdir -p "$TARGET_DIR/build"
-    printf '%s\n' "${DARLING_LOL_TOOLBOX_NAME:-$TOOLBOX_NAME}" > "$TARGET_DIR/build/toolbox-container"
+    printf '%s\n' "${DARLING_LOL_TOOLBOX_NAME:-$DEFAULT_TOOLBOX_NAME}" > "$TARGET_DIR/build/toolbox-container"
     rm -f "$TARGET_DIR/build/native-install"
   elif [[ $INSIDE_TOOLBOX != 1 ]]; then
     # Explicitly native install: record it so scripts/update.sh never re-execs

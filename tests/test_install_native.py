@@ -23,6 +23,9 @@ def installer_env(**extra):
     env.pop('DARLING_LOL_WINDOW_ENTRIES', None)
     # Keep default-release cases hermetic unless a test overrides it.
     env.pop('DARLING_LOL_TOOLBOX_RELEASE', None)
+    # A test host that is itself a distrobox must not rename the container.
+    env.pop('CONTAINER_ID', None)
+    env.pop('DARLING_LOL_TOOLBOX_ENV_FILE', None)
     # Keep locale detection deterministic unless a test overrides it.
     env['LC_ALL'] = ''
     env['LC_MESSAGES'] = ''
@@ -1549,12 +1552,13 @@ class InstallMarkerTests(unittest.TestCase):
     """Install-mode markers are written only after every install step succeeded."""
 
     def run_main(self, target, *, toolbox_env=None, preexisting=None, inside_toolbox=0,
-                 confirm_rc=0, preflight_rc=0, compile_rc=0):
+                 confirm_rc=0, preflight_rc=0, compile_rc=0, extra_stubs=''):
         """Run main() in a sourced shell with every install step stubbed out.
 
         compile_project reports compile_rc through the run stub so a build
         failure aborts main() the way the real run() would. inside_toolbox
         emulates a manual run inside a container when the env vars do not.
+        extra_stubs is shell appended after the stubs, so it can replace one.
         """
         build = Path(target) / 'build'
         build.mkdir(parents=True, exist_ok=True)
@@ -1589,6 +1593,7 @@ finish() {{ :; }}
 run() {{ shift; "$@"; }}
 info() {{ :; }}
 python3() {{ :; }}
+{extra_stubs}
 main
 '''
         env = installer_env()
@@ -1717,6 +1722,165 @@ FAKE_FAIL=1 sign_sdk_runtime
                 self.assertIn('Base Darling SDK signing failed', result.stderr)
             finally:
                 sdk.chmod(0o755)
+
+
+class ContainerDetectionTests(unittest.TestCase):
+    """distrobox is told apart from Toolbox by CONTAINER_ID next to /run/.toolboxenv."""
+
+    def source_vars(self, *, marker=True, **env):
+        with tempfile.TemporaryDirectory(prefix='install-native-container ') as folder:
+            env_file = Path(folder) / 'toolboxenv'
+            if marker:
+                env_file.touch()
+            snippet = (
+                'source "$INSTALLER"\n'
+                'printf "%s|%s|%s|%s\\n" "$INSIDE_TOOLBOX" "$TOOLBOX_NAME" '
+                '"$CONTAINER_KIND" "$ENTER_COMMAND"\n'
+            )
+            result = run_sourced(snippet, DARLING_LOL_TOOLBOX_ENV_FILE=str(env_file), **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_distrobox_name_comes_from_container_id(self):
+        self.assertEqual(self.source_vars(CONTAINER_ID='lol-dev'),
+                         '1|lol-dev|distrobox|distrobox')
+
+    def test_toolbox_name_override_still_wins_inside_distrobox(self):
+        self.assertEqual(
+            self.source_vars(CONTAINER_ID='lol-dev', DARLING_LOL_TOOLBOX_NAME='custom'),
+            '1|custom|distrobox|distrobox')
+
+    def test_toolbox_without_container_id_keeps_toolbox_wording(self):
+        self.assertEqual(self.source_vars(), '1|darling-lol|Toolbox|toolbox')
+
+    def test_empty_container_id_is_not_distrobox(self):
+        self.assertEqual(self.source_vars(CONTAINER_ID=''), '1|darling-lol|Toolbox|toolbox')
+
+    def test_container_id_without_the_marker_file_is_ignored(self):
+        self.assertEqual(self.source_vars(marker=False, CONTAINER_ID='lol-dev'),
+                         '0|darling-lol|Toolbox|toolbox')
+
+    def test_toolbox_reexec_keeps_its_own_name_and_wording(self):
+        self.assertEqual(
+            self.source_vars(CONTAINER_ID='lol-dev', DARLING_LOL_TOOLBOX='1',
+                             DARLING_LOL_TOOLBOX_NAME='my-box'),
+            '1|my-box|Toolbox|toolbox')
+
+    def test_manual_run_with_toolbox_flag_inside_distrobox_is_distrobox(self):
+        self.assertEqual(
+            self.source_vars(CONTAINER_ID='lol-dev', DARLING_LOL_TOOLBOX='1'),
+            '1|lol-dev|distrobox|distrobox')
+
+    def run_finish(self, **env):
+        with tempfile.TemporaryDirectory(prefix='install-native-container ') as folder:
+            env_file = Path(folder) / 'toolboxenv'
+            env_file.touch()
+            snippet = (
+                'source "$INSTALLER"\n'
+                'offer_desktop_entry() { return 1; }\n'
+                'offer_riot_client_installer() { return 1; }\n'
+                'git() { :; }\n'
+                'finish\n'
+            )
+            return run_sourced(snippet, DARLING_LOL_TOOLBOX_ENV_FILE=str(env_file), **env)
+
+    def test_final_hint_says_distrobox_enter_for_distrobox(self):
+        result = self.run_finish(CONTAINER_ID='lol-dev')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('  distrobox enter lol-dev\n', result.stdout)
+        self.assertNotIn('toolbox enter', result.stdout)
+
+    def test_final_hint_still_says_toolbox_enter_for_toolbox(self):
+        result = self.run_finish(DARLING_LOL_TOOLBOX='1', DARLING_LOL_TOOLBOX_NAME='my-box',
+                                 CONTAINER_ID='lol-dev')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('  toolbox enter my-box\n', result.stdout)
+        self.assertNotIn('distrobox enter', result.stdout)
+
+        result = self.run_finish()
+        self.assertIn('  toolbox enter darling-lol\n', result.stdout)
+
+    def run_main_notice(self, **env):
+        with tempfile.TemporaryDirectory(prefix='install-native-container ') as folder:
+            env_file = Path(folder) / 'toolboxenv'
+            env_file.touch()
+            env['DARLING_LOL_TOOLBOX_ENV_FILE'] = str(env_file)
+            return InstallMarkerTests().run_main(
+                folder, toolbox_env=env, inside_toolbox=1,
+                extra_stubs='info() { printf "info:%s\\n" "$*"; }')
+
+    def test_main_names_distrobox_in_the_notice(self):
+        result = self.run_main_notice(CONTAINER_ID='lol-dev')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("info:Running inside distrobox 'lol-dev'.", result.stdout)
+
+    def test_main_names_toolbox_in_the_notice(self):
+        result = self.run_main_notice()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("info:Running inside Toolbox 'darling-lol'.", result.stdout)
+
+    def test_distrobox_name_is_never_recorded_for_update(self):
+        # update.sh re-execs through `toolbox run -c <name>`, which cannot enter a distrobox.
+        with tempfile.TemporaryDirectory(prefix='install-native-container ') as folder:
+            env_file = Path(folder) / 'toolboxenv'
+            env_file.touch()
+            result = InstallMarkerTests().run_main(
+                folder, inside_toolbox=1,
+                toolbox_env={'DARLING_LOL_TOOLBOX': '1', 'CONTAINER_ID': 'lol-dev',
+                             'DARLING_LOL_TOOLBOX_ENV_FILE': str(env_file)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            marker = Path(folder) / 'build' / 'toolbox-container'
+            self.assertEqual(marker.read_text(), 'darling-lol\n')
+
+
+class GitRequirementTests(unittest.TestCase):
+    """Containers install git with the packages, so only host installs need it first."""
+
+    def run_preflight(self, *, inside_toolbox):
+        with tempfile.TemporaryDirectory(prefix='install-native-git ') as folder:
+            # No git in PATH: the sandbox only resolves the tools preflight uses.
+            bindir = bin_sandbox(folder, 'bash', 'awk', 'dirname', 'basename')
+            snippet = (
+                'source "$INSTALLER"\n'
+                'uname() { case $1 in -r) printf "6.6.0-generic" ;; *) printf "x86_64" ;; esac; }\n'
+                'df() { printf "Filesystem 1024-blocks Used Available Capacity Mounted\\n'
+                'mock 1 1 62914560 1%% /\\n"; }\n'
+                'sudo() { :; }\n'
+                'CONTAINER_INSTALL=0\n'
+                f'INSIDE_TOOLBOX={inside_toolbox}\n'
+                f'TARGET_DIR="{folder}"\n'
+                'preflight\n'
+            )
+            return run_sourced(snippet, PATH=str(bindir))
+
+    def test_missing_git_does_not_stop_preflight_inside_a_container(self):
+        result = self.run_preflight(inside_toolbox=1)
+        # It goes on to the next check, which fails because the fixture is not a checkout.
+        self.assertNotIn('Git is required', result.stderr)
+        self.assertIn("Missing 'scripts/preflight.py'", result.stderr)
+
+    def test_missing_git_still_stops_preflight_on_the_host(self):
+        result = self.run_preflight(inside_toolbox=0)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Git is required.', result.stderr)
+
+    def test_require_git_fails_without_git(self):
+        with tempfile.TemporaryDirectory(prefix='install-native-git ') as folder:
+            bindir = bin_sandbox(folder, 'bash', 'dirname', 'basename')
+            result = run_sourced('source "$INSTALLER"\nrequire_git\n', PATH=str(bindir))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Git is required.', result.stderr)
+
+    def test_main_requires_git_after_the_packages_are_installed(self):
+        with tempfile.TemporaryDirectory(prefix='install-native-git ') as folder:
+            result = InstallMarkerTests().run_main(
+                folder, inside_toolbox=1,
+                extra_stubs=(
+                    'install_packages() { printf "packages\\n"; }\n'
+                    'require_git() { printf "git\\n"; }\n'
+                ))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.split(), ['packages', 'git'])
 
 
 if __name__ == '__main__':
