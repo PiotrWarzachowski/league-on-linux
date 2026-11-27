@@ -26,6 +26,7 @@ def facts(**overrides):
         'disk': {'free': 100 * GIB, 'free_gib': 100.0},
         'gpus': [{'card': 'card0', 'driver': 'i915', 'vendor_id': '0x8086',
                   'device_id': '0x9b41', 'name': 'UHD 620'}],
+        'nvidia_egl': {'driver_version': '', 'gbm_backend': True, 'x11_platform': True},
         'vulkan_icds': ['/usr/share/vulkan/icd.d/intel_icd.json'],
         'prefix': '/tmp/prefix',
         'prefix_exists': True,
@@ -311,6 +312,144 @@ class HybridAndSwitchTests(unittest.TestCase):
                                  which=lambda name: None)
             self.assertEqual(data['trace_env'], ['DARLING_METAL_DEVICE_LOG', 'RCLOL_INPUT_TRACE'])
             self.assertEqual(doctor.report(data, [])['trace_env'], data['trace_env'])
+
+
+class NvidiaEglTests(unittest.TestCase):
+    def egl(self, **fields):
+        base = {'driver_version': '595.112.07', 'gbm_backend': True, 'x11_platform': True}
+        base.update(fields)
+        return base
+
+    def test_no_nvidia_gpu_is_ok(self):
+        self.assertEqual(doctor.check_nvidia_egl(facts(nvidia_egl=self.egl(gbm_backend=False)))[0], 'ok')
+
+    def test_hybrid_without_offload_is_ok(self):
+        data = facts(gpus=[INTEL, NVIDIA], nvidia_egl=self.egl(gbm_backend=False, x11_platform=False))
+        self.assertEqual(doctor.check_nvidia_egl(data)[0], 'ok')
+
+    def test_hybrid_with_offload_needs_the_libraries(self):
+        data = facts(gpus=[INTEL, NVIDIA], environment=PRIME, nvidia_egl=self.egl(gbm_backend=False))
+        self.assertEqual(doctor.check_nvidia_egl(data)[0], 'warn')
+
+    def test_old_driver_has_x11_egl_built_in(self):
+        data = facts(gpus=[NVIDIA], nvidia_egl=self.egl(driver_version='550.120', gbm_backend=False,
+                                                          x11_platform=False))
+        status, message = doctor.check_nvidia_egl(data)
+        self.assertEqual(status, 'ok')
+        self.assertIn('550.120', message)
+
+    def test_missing_gbm_link_warns_and_names_it(self):
+        status, message = doctor.check_nvidia_egl(facts(gpus=[NVIDIA], nvidia_egl=self.egl(gbm_backend=False)))
+        self.assertEqual(status, 'warn')
+        self.assertIn('nvidia-drm_gbm.so', message)
+        self.assertIn('libnvidia-allocator.so.1', message)
+        self.assertNotIn('libnvidia-egl-xcb', message)
+        self.assertIn('eglGetDisplay(DEFAULT)=NO_DISPLAY', message)
+        self.assertIn('distrobox --nvidia', message)
+        self.assertIn('"NVIDIA EGL inside a container"', message)
+
+    def test_missing_x11_platform_warns_and_names_it(self):
+        status, message = doctor.check_nvidia_egl(facts(gpus=[NVIDIA], nvidia_egl=self.egl(x11_platform=False)))
+        self.assertEqual(status, 'warn')
+        self.assertIn('libnvidia-egl-xcb', message)
+        self.assertIn('libnvidia-egl-xlib1', message)
+        self.assertNotIn('nvidia-drm_gbm.so', message)
+
+    def test_both_missing_names_both(self):
+        data = facts(gpus=[NVIDIA], nvidia_egl=self.egl(gbm_backend=False, x11_platform=False))
+        message = doctor.check_nvidia_egl(data)[1]
+        self.assertIn('nvidia-drm_gbm.so', message)
+        self.assertIn('libnvidia-egl-xcb', message)
+
+    def test_everything_present_is_ok(self):
+        self.assertEqual(doctor.check_nvidia_egl(facts(gpus=[NVIDIA], nvidia_egl=self.egl()))[0], 'ok')
+        unknown = self.egl(driver_version='')
+        self.assertEqual(doctor.check_nvidia_egl(facts(gpus=[NVIDIA], nvidia_egl=unknown))[0], 'ok')
+
+    def test_nvidia_egl_check_follows_the_hybrid_check(self):
+        ids = [key for key, _title, _check in doctor.CHECKS]
+        self.assertEqual(ids[ids.index('hybrid') + 1], 'nvidia_egl')
+
+    def make_tree(self, root, gbm=True, platform=True, dangling=False):
+        gbm_dir = root / 'usr/lib/x86_64-linux-gnu/gbm'
+        gbm_dir.mkdir(parents=True)
+        if gbm:
+            if not dangling:
+                (gbm_dir / 'libnvidia-allocator.so.1').write_text('')
+            (gbm_dir / 'nvidia-drm_gbm.so').symlink_to('libnvidia-allocator.so.1')
+        egl_dir = root / 'usr/share/egl/egl_external_platform.d'
+        egl_dir.mkdir(parents=True)
+        (egl_dir / '10_nvidia_wayland.json').write_text(
+            json.dumps({'file_format_version': '1.0.0', 'ICD': {'library_path': 'libnvidia-egl-wayland.so.1'}}))
+        if platform:
+            (egl_dir / '20_nvidia_xcb.json').write_text(
+                json.dumps({'file_format_version': '1.0.0', 'ICD': {'library_path': 'libnvidia-egl-xcb.so.1'}}))
+
+    def test_facts_read_the_gbm_link_and_platform_config(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.make_tree(root)
+            module = root / 'sys/module/nvidia'
+            module.mkdir(parents=True)
+            (module / 'version').write_text('595.112.07\n')
+            found = doctor.nvidia_egl_facts({}, root / 'sys', root / 'proc', root)
+            self.assertEqual(found, {'driver_version': '595.112.07', 'gbm_backend': True, 'x11_platform': True})
+
+    def test_facts_report_missing_pieces(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.make_tree(root, gbm=False, platform=False)
+            found = doctor.nvidia_egl_facts({}, root / 'sys', root / 'proc', root)
+            self.assertEqual(found, {'driver_version': '', 'gbm_backend': False, 'x11_platform': False})
+
+    def test_a_dangling_gbm_link_counts_as_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.make_tree(root, dangling=True)
+            self.assertFalse(doctor.nvidia_egl_facts({}, root / 'sys', root / 'proc', root)['gbm_backend'])
+
+    def test_driver_version_falls_back_to_proc(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.assertEqual(doctor.nvidia_driver_version(root / 'sys', root / 'proc'), '')
+            proc = root / 'proc/driver/nvidia'
+            proc.mkdir(parents=True)
+            (proc / 'version').write_text('NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.112.07  '
+                                          'Tue Nov 3 12:00:00 UTC 2026\n')
+            self.assertEqual(doctor.nvidia_driver_version(root / 'sys', root / 'proc'), '595.112.07')
+
+    def test_environment_directories_replace_the_defaults(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.make_tree(root, gbm=False, platform=False)
+            custom_gbm = root / 'custom/gbm'
+            custom_gbm.mkdir(parents=True)
+            (custom_gbm / 'libnvidia-allocator.so.1').write_text('')
+            (custom_gbm / 'nvidia-drm_gbm.so').symlink_to('libnvidia-allocator.so.1')
+            custom_egl = root / 'custom/egl'
+            custom_egl.mkdir()
+            (custom_egl / 'x.json').write_text('{"ICD": {"library_path": "/opt/libnvidia-egl-xlib.so.1"}}')
+            (custom_egl / 'broken.json').write_text('not json')
+            (custom_egl / 'other.json').write_text('["ICD"]')
+            env = {'GBM_BACKENDS_PATH': '/nonexistent:%s' % custom_gbm,
+                   '__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS': str(custom_egl)}
+            found = doctor.nvidia_egl_facts(env, root / 'sys', root / 'proc', root)
+            self.assertTrue(found['gbm_backend'])
+            self.assertTrue(found['x11_platform'])
+            files = {'__EGL_EXTERNAL_PLATFORM_CONFIG_FILENAMES': str(custom_egl / 'broken.json')}
+            self.assertFalse(doctor.nvidia_egl_facts(files, root / 'sys', root / 'proc', root)['x11_platform'])
+
+    def test_gather_keeps_only_booleans_and_the_version(self):
+        with tempfile.TemporaryDirectory() as folder:
+            env = {'GBM_BACKENDS_PATH': folder, '__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS': folder}
+            data = doctor.gather(prefix=Path(folder), env=env, host_tmp=Path(folder),
+                                 sys_root=Path(folder) / 'sys', proc_root=Path(folder) / 'proc',
+                                 which=lambda name: None, perf_probe=lambda: 'ok')
+            self.assertEqual(data['nvidia_egl'], {'driver_version': '', 'gbm_backend': False,
+                                                  'x11_platform': False})
+            document = doctor.report(data, doctor.run_checks(data))
+            self.assertEqual(document['nvidia_egl'], data['nvidia_egl'])
+            self.assertNotIn(folder, json.dumps(document['nvidia_egl']))
 
 
 class PrefixStateTests(unittest.TestCase):

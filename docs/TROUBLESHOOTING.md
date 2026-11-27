@@ -1316,6 +1316,43 @@ the matching `IOGraphicsAccelerator2` entry for every host card.
 
 These are host settings, not game settings. Run on AC power, and use a performance power profile (`powerprofilesctl set performance`, or `asusctl profile -P Performance` on ASUS laptops). On the tested desktop the game is limited mostly by its own main thread on the CPU, not by the GPU (see [status](STATUS.md#game-fps-2026-10-1314)), so laptop CPU power limits matter as much as the GPU choice.
 
+### NVIDIA EGL inside a container
+
+Symptom: with an NVIDIA GPU, the Riot Client aborts at start and no window opens. The log shows
+
+```text
+M58DG ensureDefaultDisplay: eglGetDisplay(DEFAULT)=NO_DISPLAY
+libc++abi: terminating with uncaught exception of type NSException
+```
+
+NVIDIA EGL on X11 needs three things in the environment that runs the launcher. With driver series 560 and newer, two of them are separate packages or links that a container does not always get from the host:
+
+- The GBM backend `gbm/nvidia-drm_gbm.so`, a link to `libnvidia-allocator.so.1` in the GBM backend directory (`/usr/lib/x86_64-linux-gnu/gbm` on Debian and Ubuntu; `GBM_BACKENDS_PATH` overrides it). `distrobox create --nvidia` mounts `libnvidia-allocator.so*` into the container but not this link, so the directory only holds Mesa's `dri_gbm.so`.
+- The EGL external platform libraries `libnvidia-egl-xcb.so.1` and `libnvidia-egl-xlib.so.1`, registered by `20_nvidia_xcb.json` and `20_nvidia_xlib.json` in `/usr/share/egl/egl_external_platform.d/`. Some host driver packages (the Void Linux one, for example) do not ship them, so there is nothing for distrobox to mount. In an Ubuntu or Debian container they come from the `libnvidia-egl-xcb1` and `libnvidia-egl-xlib1` packages.
+- PRIME render offload, when the laptop is hybrid (see [Run on the discrete GPU](#run-on-the-discrete-gpu)).
+
+Measured on an MSI GE66 Raider (i7-11800H, RTX 3080 Laptop, driver 595.112.07, Void Linux, niri with Xwayland) inside a distrobox 1.8.2.5 container (image ubuntu:26.04, Mesa 26.0.8). A small program called `eglGetDisplay(EGL_DEFAULT_DISPLAY)` and `eglInitialize` with `EGL_PLATFORM=x11` and the NVIDIA EGL vendor forced (`__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json`):
+
+| GBM link | xcb/xlib platform libraries | PRIME offload | Result |
+|---|---|---|---|
+| no | yes | yes | `NO_DISPLAY` |
+| yes | no | yes | `NO_DISPLAY` |
+| yes | yes | no | `NO_DISPLAY` |
+| yes | yes | yes | OK, EGL 1.5 |
+
+`glxinfo -B` with PRIME offload worked on the NVIDIA GPU the whole time; only EGL failed. The hybrid graphics check alone reports `Hybrid graphics with PRIME offload` in this state, which is why the doctor has a separate `NVIDIA EGL` check.
+
+Fix for an Ubuntu or Debian container:
+
+```sh
+sudo ln -s /usr/lib/x86_64-linux-gnu/libnvidia-allocator.so.1 /usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so
+sudo apt install libnvidia-egl-xcb1 libnvidia-egl-xlib1
+```
+
+The link lives in the container's filesystem, so it is gone when the container is recreated; run the two commands again. On other distributions, install the package that provides `libnvidia-egl-xcb` and `libnvidia-egl-xlib` and link `nvidia-drm_gbm.so` in the directory `gbm/` of your library path.
+
+`darling-lol --doctor` (or `python3 tools/doctor.py`) reports the first two items as `NVIDIA EGL` when it runs with an NVIDIA GPU and driver 560 or newer. On a hybrid laptop it checks only when `__NV_PRIME_RENDER_OFFLOAD=1` is set, so run it the same way as the launcher (for example under `prime-run`).
+
 ## Mouse latency despite good FPS
 
 [Issue #10](https://github.com/lucannez64/darling-lol/issues/10) reports mouse latency with FPS comparable to Windows. FPS alone does not measure input-to-display latency, and the report does not yet identify which stage adds the delay.
