@@ -1162,6 +1162,16 @@ __NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only __GLX_VENDOR_LIBRA
 __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json sh scripts/run.sh
 ```
 
+On hosts with Mesa's `VK_LAYER_MESA_device_select` layer the PRIME variables are not enough to put the NVIDIA GPU first. The layer runs before `VK_LAYER_NV_optimus`, and Indium takes the first Vulkan device, so Vulkan can render on the integrated GPU while EGL presents on NVIDIA: a white screen with the cursor, and `Metal Device GPU` in `r3dlog` names the integrated card. Measured with `vulkaninfo --summary` under `__NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only` (Intel UHD TGL GT1 and RTX 3080 Laptop):
+
+| extra variable | device order |
+|---|---|
+| none | Intel UHD, RTX 3080 Laptop, llvmpipe |
+| `NODEVICE_SELECT=1` | RTX 3080 Laptop, Intel UHD, llvmpipe |
+| `MESA_VK_DEVICE_SELECT=10de:249c!` | RTX 3080 Laptop only |
+
+With `__NV_PRIME_RENDER_OFFLOAD=1` the launcher therefore sets `MESA_VK_DEVICE_SELECT=10de:<device>!` for the first NVIDIA card in `/sys/class/drm`; with it set, `Metal Device GPU` named the NVIDIA card and matches rendered normally. Setting `MESA_VK_DEVICE_SELECT` (any value, even empty) or `NODEVICE_SELECT` yourself overrides the default; the launcher then leaves both alone.
+
 The guest file `/tmp/metal-gpu` (a device index or part of its name, for example `nvidia`) moves only the Vulkan side. Use it for diagnosis: on its own it splits the two sides across GPUs, and frames cannot be presented.
 
 ### PRIME render offload halves the frame rate

@@ -205,6 +205,37 @@ if [ -z "${VK_DRIVER_FILES:-}" ] && [ -z "${VK_ICD_FILENAMES:-}" ]; then
   fi
  fi
 fi
+# --- Vulkan device order under PRIME offload, before any helper can start Darling ---
+# Mesa's implicit VK_LAYER_MESA_device_select layer runs before VK_LAYER_NV_optimus and can
+# list the integrated GPU first even with the PRIME variables set. Indium takes the first
+# Vulkan device, so Vulkan rendered on the integrated GPU while EGL presented on NVIDIA
+# (a white or black window). MESA_VK_DEVICE_SELECT=<vendor>:<device>! makes the layer expose
+# only that device. A MESA_VK_DEVICE_SELECT or NODEVICE_SELECT set by the user, even empty, wins.
+# Prints the PCI device id (lowercase hex, no 0x) of the first NVIDIA DRM card, nothing if
+# there is none. $1 replaces /sys/class/drm in tests.
+host_nvidia_drm_device() {
+ for dfile in "${1:-/sys/class/drm}"/card[0-9]/device "${1:-/sys/class/drm}"/card[0-9][0-9]/device; do
+  [ -r "$dfile/vendor" ] || continue
+  v=$(sed 's/^0x//' "$dfile/vendor" 2>/dev/null || true)
+  [ "$v" = 10de ] || continue
+  d=$(awk 'NR == 1 { print tolower($1) }' "$dfile/device" 2>/dev/null || true)
+  d=${d#0x}
+  case "$d" in ''|*[!0-9a-f]*) continue;; esac
+  printf '%s\n' "$d"
+  return 0
+ done
+}
+# Exports MESA_VK_DEVICE_SELECT=10de:<device>! under PRIME offload. $1 replaces /sys/class/drm in tests.
+select_prime_vulkan_device() {
+ [ "${__NV_PRIME_RENDER_OFFLOAD:-}" = 1 ] || return 0
+ [ -z "${MESA_VK_DEVICE_SELECT+x}" ] || return 0
+ [ -z "${NODEVICE_SELECT+x}" ] || return 0
+ nv_device=$(host_nvidia_drm_device "${1:-/sys/class/drm}")
+ if [ -n "$nv_device" ]; then
+  export MESA_VK_DEVICE_SELECT="10de:$nv_device!"
+ fi
+}
+select_prime_vulkan_device
 # On GNOME/Mutter Wayland, Xwayland writes its auth cookie under XDG_RUNTIME_DIR
 # (.mutter-Xwaylandauth.*), a new one at every login. Export the newest one before any
 # helper can start Darling so launchd and iokitd inherit XAUTHORITY. Nothing is copied
