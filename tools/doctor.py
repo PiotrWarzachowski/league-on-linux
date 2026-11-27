@@ -78,6 +78,12 @@ HOST_TUNING_SWITCHES = (
 )
 DISCRETE_DRIVERS = ('nvidia', 'nouveau')
 INTEGRATED_DRIVERS = ('i915', 'xe', 'amdgpu', 'radeon')
+# Where the GBM loader and libglvnd look when GBM_BACKENDS_PATH and the
+# __EGL_EXTERNAL_PLATFORM_CONFIG_* variables are unset, relative to the root.
+GBM_BACKEND_DIRS = ('usr/lib/x86_64-linux-gnu/gbm', 'usr/lib64/gbm', 'usr/lib/gbm')
+EGL_PLATFORM_DIRS = ('etc/egl/egl_external_platform.d', 'usr/share/egl/egl_external_platform.d')
+# Since the 560 series NVIDIA EGL on X11 goes through external platform libraries.
+NVIDIA_X11_EGL_MAJOR = 560
 
 
 def read_text(path, default=''):
@@ -180,6 +186,55 @@ def vulkan_icds(env=None):
             if item not in found:
                 found.append(item)
     return found
+
+
+def split_paths(value):
+    return [item for item in (value or '').split(':') if item]
+
+
+def nvidia_driver_version(sys_root=Path('/sys'), proc_root=Path('/proc')):
+    """The loaded NVIDIA kernel driver version, or '' when it cannot be read."""
+    version = read_text(Path(sys_root) / 'module/nvidia/version').strip()
+    if not version:
+        match = re.search(r'Kernel Module\s+(\d+(?:\.\d+)*)',
+                          read_text(Path(proc_root) / 'driver/nvidia/version'))
+        version = match.group(1) if match else ''
+    return version if re.fullmatch(r'\d+(?:\.\d+)*', version) else ''
+
+
+def nvidia_x11_platform(env, root=Path('/')):
+    """Whether an EGL external platform config registers the NVIDIA X11 libraries."""
+    files = split_paths(env.get('__EGL_EXTERNAL_PLATFORM_CONFIG_FILENAMES'))
+    if not files:
+        folders = split_paths(env.get('__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS'))
+        for folder in folders or [Path(root) / item for item in EGL_PLATFORM_DIRS]:
+            try:
+                files += sorted(str(p) for p in Path(folder).glob('*.json'))
+            except OSError:
+                pass
+    for item in files:
+        try:
+            library = json.loads(read_text(item))['ICD']['library_path']
+        except (ValueError, KeyError, TypeError):
+            continue
+        if re.search(r'libnvidia-egl-(?:xcb|xlib)', str(library)):
+            return True
+    return False
+
+
+def nvidia_egl_facts(env=None, sys_root=Path('/sys'), proc_root=Path('/proc'), root=Path('/')):
+    """What NVIDIA EGL on X11 needs: driver version, GBM backend link, X11 platform config.
+
+    A dangling nvidia-drm_gbm.so link counts as missing. Only booleans and the
+    version are kept, so the report stays free of local paths.
+    """
+    env = os.environ if env is None else env
+    folders = split_paths(env.get('GBM_BACKENDS_PATH')) or [Path(root) / item for item in GBM_BACKEND_DIRS]
+    return {
+        'driver_version': nvidia_driver_version(sys_root, proc_root),
+        'gbm_backend': any((Path(folder) / 'nvidia-drm_gbm.so').exists() for folder in folders),
+        'x11_platform': nvidia_x11_platform(env, root),
+    }
 
 
 def prefix_state(prefix, proc_root=Path('/proc')):
@@ -431,6 +486,7 @@ def gather(prefix=None, env=None, proc_root=Path('/proc'), sys_root=Path('/sys')
         },
         'disk': {'free': free_disk, 'free_gib': gib(free_disk)},
         'gpus': read_gpus(sys_root, proc_root),
+        'nvidia_egl': nvidia_egl_facts(env, sys_root, proc_root),
         'vulkan_icds': vulkan_icds(env),
         'prefix': str(prefix),
         'workspace': env.get('DARLING_WORKSPACE', ''),
@@ -522,6 +578,31 @@ def check_hybrid(facts):
                         'NVIDIA_only and __GLX_VENDOR_LIBRARY_NAME=nvidia too (prime-run sets all three); '
                         + guide)
     return 'ok', 'Hybrid graphics with PRIME offload'
+
+
+def check_nvidia_egl(facts):
+    drivers = {gpu['driver'] for gpu in facts['gpus']}
+    if 'nvidia' not in drivers:
+        return 'ok', 'No NVIDIA GPU'
+    if drivers & set(INTEGRATED_DRIVERS) and facts['environment'].get('__NV_PRIME_RENDER_OFFLOAD') != '1':
+        return 'ok', 'NVIDIA EGL is not used without PRIME offload'
+    egl = facts['nvidia_egl']
+    version = egl['driver_version']
+    if version and int(version.split('.')[0]) < NVIDIA_X11_EGL_MAJOR:
+        return 'ok', 'NVIDIA driver %s has X11 EGL built in' % version
+    missing = []
+    if not egl['gbm_backend']:
+        missing.append('the GBM backend gbm/nvidia-drm_gbm.so (link it to libnvidia-allocator.so.1)')
+    if not egl['x11_platform']:
+        missing.append('the X11 platform libraries libnvidia-egl-xcb and libnvidia-egl-xlib (install the '
+                       "distribution's packages, for example libnvidia-egl-xcb1 libnvidia-egl-xlib1 on "
+                       'Debian and Ubuntu)')
+    if missing:
+        return 'warn', ('NVIDIA EGL on X11 is missing %s; without them the Riot Client stops at start with '
+                        'eglGetDisplay(DEFAULT)=NO_DISPLAY. In a container, distrobox --nvidia does not '
+                        'create the GBM link; see docs/TROUBLESHOOTING.md, "NVIDIA EGL inside a container"'
+                        % ' and '.join(missing))
+    return 'ok', 'GBM backend and X11 platform libraries found'
 
 
 def check_switches(facts):
@@ -699,6 +780,7 @@ CHECKS = (
     ('gpu', 'GPU driver', check_gpu),
     ('vulkan', 'Vulkan driver', check_vulkan),
     ('hybrid', 'Hybrid graphics', check_hybrid),
+    ('nvidia_egl', 'NVIDIA EGL', check_nvidia_egl),
     ('session', 'Display session', check_session),
     ('wayland', 'Experimental Wayland game window', check_wayland),
     ('hud', 'Overlay layer', check_hud),
@@ -773,6 +855,7 @@ def report(facts, results, redact=True):
         'memory': facts['memory'],
         'disk': facts['disk'],
         'gpus': facts['gpus'],
+        'nvidia_egl': facts.get('nvidia_egl', {}),
         'vulkan_icds': icds,
         'prefix': '<prefix>' if redact else prefix,
         'redacted': redact,
